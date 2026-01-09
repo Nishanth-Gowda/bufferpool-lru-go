@@ -1,148 +1,276 @@
-# LRU Cache Implementation
+# LRU Cache Implementations in Go
 
-## Overview
-This is an optimized implementation of an LRU (Least Recently Used) Cache in Go using a **HashMap + Doubly Linked List** data structure.
+A comprehensive comparison of **two LRU cache implementations**: a traditional LRU cache and a MySQL InnoDB-inspired BufferPool LRU cache, complete with extensive benchmarks.
 
-## Time Complexity
-- **Get(key)**: O(1)
-- **Put(key, value)**: O(1)
+## 📋 Table of Contents
+- [Implementations](#implementations)
+- [The Inspiration: MySQL InnoDB Buffer Pool](#the-inspiration-mysql-innodb-buffer-pool)
+- [How BufferPool LRU Works](#how-bufferpool-lru-works)
+- [Benchmark Results](#benchmark-results)
+- [When to Use Which](#when-to-use-which)
+- [Usage Examples](#usage-examples)
+- [Project Structure](#project-structure)
 
-## Space Complexity
-- O(capacity) - stores at most `capacity` items
+---
 
-## Data Structure Choice
+## Implementations
 
-### Why HashMap + Doubly Linked List?
-- **HashMap**: Provides O(1) lookup for cache entries
-- **Doubly Linked List**: Provides O(1) insertion/deletion for maintaining LRU order
-  - Most recently used items are at the **front** (head)
-  - Least recently used items are at the **back** (tail)
+### 1. **Normal LRU Cache** (`lru/lru/`)
+A classic LRU cache implementation using HashMap + Doubly Linked List.
 
-## Key Optimizations Implemented
+**Features:**
+- O(1) `Get` and `Put` operations
+- Most recently used items at the front (head)
+- Least recently used items at the back (tail)
+- Automatic eviction when capacity is reached
 
-### 1. Pointer Cleanup
-**Why?** Prevents memory leaks and helps garbage collection.
+### 2. **BufferPool LRU Cache** (`lru/bufferpool-lru/`)
+An advanced LRU implementation inspired by MySQL InnoDB's buffer pool management strategy.
 
-```go
-// In RemoveNode - clear pointers after removal
-node.Prev = nil
-node.Next = nil
+**Features:**
+- O(1) operations (same as normal LRU)
+- Splits cache into **"New"** and **"Old"** sublists
+- Configurable split ratio (e.g., 70% old, 30% new)
+- Protects frequently accessed items from eviction
+- Better performance for high-locality workloads
+
+---
+
+## The Inspiration: MySQL InnoDB Buffer Pool
+
+### Background
+MySQL's InnoDB storage engine uses a sophisticated buffer pool management algorithm to cache frequently accessed database pages in memory. The challenge it solves:
+
+> **Problem**: Traditional LRU evicts items that were accessed once recently, even if other items are accessed repeatedly. This is suboptimal for database workloads with full table scans or bulk operations.
+
+### InnoDB's Solution: The Midpoint Insertion Strategy
+
+InnoDB maintains a **single list** but logically splits it into two regions:
+```
+[New List (30%)] → [MidPoint] → [Old List (70%)]
+     ↑ Hot data         ↑           ↑ Warm/cold data
 ```
 
-### 2. Prevent Dangling References
-**Why?** When a node is moved from middle to front, old `Prev` pointer must be cleared.
+**Key Behaviors:**
+1. **New pages** are inserted at the **midpoint** (not the head!), going into the "Old" sublist
+2. **Only when accessed again** do they get promoted to the "New" sublist (moved to head)
+3. This prevents a single table scan from evicting all your hot cache data
 
-```go
-// In AddFront - clear prev before re-linking
-node.Prev = nil  // Critical for reused nodes
-node.Next = list.Head
+### Why This Matters
+Consider a database scenario:
+- You have 1000 frequently accessed customer records (hot data)
+- Someone runs `SELECT * FROM orders` scanning 10,000 order records (cold data)
+- **Traditional LRU**: The scan would evict all 1000 customer records ❌
+- **BufferPool LRU**: Scan pages enter the "Old" list and evict each other, preserving hot customer data ✅
+
+---
+
+## How BufferPool LRU Works
+
+### Architecture
+```
+BufferPool Structure:
+┌─────────────────────────────────────────────────┐
+│ HashMap (cache)                                 │
+│ {key1: *Node1, key2: *Node2, ...}              │
+└─────────────────────────────────────────────────┘
+                    ↓
+┌─────────────────────────────────────────────────┐
+│ Doubly Linked List                              │
+│                                                 │
+│  [Head] ← New List (IsOld=false) → [MidPoint]  │
+│                     30%                  ↓      │
+│                                    Old List     │
+│                                   (IsOld=true)  │
+│                                        70%      │
+│                                         ↓       │
+│                                      [Tail]     │
+└─────────────────────────────────────────────────┘
 ```
 
-### 3. Direct Map Access
-**Why?** Using `map[key]*Node` allows direct O(1) access without iteration.
+### Key Components
 
+#### 1. **Node Structure**
 ```go
-node, ok := lru.cache[key]  // O(1) lookup
-```
-
-## Potential Further Optimizations
-
-### Option 1: Add Fast Path for Head Node
-Skip unnecessary operations if the node is already at the front:
-
-```go
-func (lru *LRUCache) Get(key int) int {
-    node, ok := lru.cache[key]
-    if !ok {
-        return -1
-    }
-    
-    // Fast path: already at front
-    if node == lru.list.Head {
-        return node.Value
-    }
-    
-    lru.list.RemoveNode(node)
-    lru.list.AddFront(node)
-    return node.Value
+type Node struct {
+    Key   int
+    Value int
+    Prev  *Node
+    Next  *Node
+    IsOld bool  // Tracks which sublist the node belongs to
 }
 ```
 
-### Option 2: Use Sentinel Nodes (Dummy Head/Tail)
-Eliminates nil checks in list operations:
-
+#### 2. **BufferPool Fields**
 ```go
-// Instead of nil head/tail, use dummy nodes
-type DoublyLinkedList struct {
-    Head *Node  // dummy sentinel
-    Tail *Node  // dummy sentinel
+type BufferPool struct {
+    capacity       int              // Total cache size
+    cache          map[int]*Node    // O(1) lookup
+    list           *DoublyLinkedList
+    MidPoint       *Node            // Boundary between new and old
+    OldRatio       float64          // E.g., 0.7 for 70% old
+    MaxOldSize     int              // Target old list size
+    currentOldSize int              // Actual old list size
 }
 ```
 
-### Option 3: Sync Pool for Node Allocation
-Reuse node objects to reduce GC pressure:
+### Operations
 
-```go
-var nodePool = sync.Pool{
-    New: func() interface{} {
-        return &Node{}
-    },
-}
+#### **Put (Insert)**
+```
+New item → Insert at MidPoint (becomes head of "Old" list)
+         → Mark as IsOld = true
+         → If Old list exceeds MaxOldSize, move MidPoint forward
 ```
 
-## Comparison with Other Approaches
-
-| Approach | Get | Put | Space | Pros | Cons |
-|----------|-----|-----|-------|------|------|
-| **HashMap + DLL** (Current) | O(1) | O(1) | O(n) | Fast, Simple | Extra space for pointers |
-| Array + Timestamps | O(n) | O(n) | O(n) | Simple | Slow eviction |
-| Heap + HashMap | O(log n) | O(log n) | O(n) | Priority-based | Slower than DLL |
-| Ring Buffer | O(1) | O(1) | O(n) | Cache-friendly | Complex implementation |
-
-## Current vs Optimized Comparison
-
-### Before Optimization
-```go
-func (list *DoublyLinkedList) AddFront(node *Node) {
-    node.Next = list.Head  // ❌ node.Prev may point to old location
-    list.Head.Prev = node
-    list.Head = node
-}
-
-func (list *DoublyLinkedList) RemoveNode(node *Node) {
-    // ... removal logic ...
-    // ❌ Doesn't clear node.Prev and node.Next
-}
+#### **Get (Access)**
+```
+If node.IsOld == true:
+    → Promote to "New" list (move to Head)
+    → Set IsOld = false
+    → Decrement currentOldSize
+    → Update MidPoint if necessary
+Else:
+    → Already in "New" list, just move to Head
 ```
 
-**Issues:**
-- Dangling references when reusing nodes
-- Potential memory leaks
-- GC has to trace unnecessary pointers
-
-### After Optimization
-```go
-func (list *DoublyLinkedList) AddFront(node *Node) {
-    node.Prev = nil  // ✅ Clear before adding
-    node.Next = list.Head
-    list.Head.Prev = node
-    list.Head = node
-}
-
-func (list *DoublyLinkedList) RemoveNode(node *Node) {
-    // ... removal logic ...
-    node.Prev = nil  // ✅ Help GC
-    node.Next = nil
-}
+#### **Eviction**
+```
+Always evict from Tail (the oldest item in "Old" list)
+→ This protects "New" list items from eviction
 ```
 
-**Benefits:**
-- ✅ No dangling references
-- ✅ Better garbage collection
-- ✅ Cleaner memory state
-- ✅ Easier debugging
+### Example Flow
 
-## Usage Example
+```
+Initial state: capacity=5, OldRatio=0.6 (MaxOldSize=3)
+
+Step 1: Put(1,A), Put(2,B), Put(3,C)
+List: [1]→[2]→[3]
+       ↑MidPoint
+All marked IsOld=true
+
+Step 2: Get(1) - Promotes to New
+List: [1]→[2]→[3]
+      New  ↑   Old
+           MidPoint
+
+Step 3: Put(4,D), Put(5,E)
+List: [1]→[4]→[5]→[2]→[3]
+      New        ↑  Old
+                 MidPoint
+
+Step 4: Get(3) - Promotes from Old to New
+List: [3]→[1]→[4]→[5]→[2]
+      New            ↑  Old
+                     MidPoint
+
+Step 5: Put(6,F) - Cache full, evicts [2]
+List: [3]→[1]→[6]→[4]→[5]
+      New            ↑  Old
+                     MidPoint
+```
+
+---
+
+## Benchmark Results
+
+Benchmarked on **Apple M4 Pro** (12 cores, ARM64) with **3-second runs per benchmark**.
+
+### Complete Results
+
+| Benchmark Scenario | Normal LRU | BufferPool LRU | Winner | % Difference |
+|-------------------|------------|----------------|---------|--------------|
+| **Sequential Writes** | 10.05 ns/op | **9.63 ns/op** | BufferPool | **+4.2%** ✅ |
+| **With Eviction** | **30.84 ns/op** | 39.91 ns/op | Normal | **-29.4%** ⚠️ |
+| **Cache Hits** | 7.92 ns/op | **7.86 ns/op** | BufferPool | +0.8% ✅ |
+| **Cache Misses** | 11.28 ns/op | **10.39 ns/op** | BufferPool | **+7.9%** ✅ |
+| **Mixed Ops (50/50)** | 9.24 ns/op | **8.64 ns/op** | BufferPool | **+6.6%** ✅ |
+| **High Locality (80/20)** | 9.80 ns/op | **9.40 ns/op** | BufferPool | **+4.1%** ✅ |
+| **Update Existing** | 10.88 ns/op | **9.60 ns/op** | BufferPool | **+11.7%** ✅ ⭐ |
+| **Small Cache (10)** | **32.68 ns/op** | 44.08 ns/op | Normal | **-34.9%** ⚠️ |
+| **Large Cache (10K)** | 14.51 ns/op | **14.02 ns/op** | BufferPool | **+3.4%** ✅ |
+
+**Memory Usage**: Both implementations use **48 B/op** and **1 alloc/op** for operations requiring new node allocation.
+
+### Key Takeaways
+
+#### ✅ **BufferPool LRU Wins in 7/9 Scenarios**
+
+1. **Best Performance**: Update operations (+11.7%)
+   - The midpoint strategy reduces unnecessary list reorganization for repeated updates
+
+2. **Strong in Mixed Workloads**: +6.6% improvement
+   - Real-world caches have mixed read/write patterns
+
+3. **High Locality Advantage**: +4.1% improvement
+   - Validates the core design goal: protect frequently accessed data
+
+4. **Scales Better**: Large cache performance (+3.4%)
+   - Overhead becomes negligible with larger caches
+
+#### ⚠️ **Normal LRU Wins in High-Eviction Scenarios**
+
+1. **Eviction Overhead**: -29.4% slower
+   - BufferPool must update midpoint, adjust counters, check IsOld flags
+
+2. **Small Cache Penalty**: -34.9% slower
+   - Overhead is proportionally higher with tiny caches
+
+### Performance Distribution
+
+```
+Sequential Writes:    [████████████████████] BufferPool +4.2%
+Cache Hits:           [████████████████████] BufferPool +0.8%
+Cache Misses:         [████████████████████] BufferPool +7.9%
+Mixed Operations:     [████████████████████] BufferPool +6.6%
+High Locality:        [████████████████████] BufferPool +4.1%
+Update Existing:      [████████████████████] BufferPool +11.7% ⭐
+Large Cache:          [████████████████████] BufferPool +3.4%
+
+With Eviction:        [█████████████       ] Normal +29.4% faster
+Small Cache:          [█████████████       ] Normal +34.9% faster
+```
+
+---
+
+## When to Use Which
+
+### 🎯 Use **BufferPool LRU** when:
+
+✅ **Frequent updates** to existing cache entries  
+✅ **High locality** workloads (80/20 rule: 80% of accesses to 20% of data)  
+✅ **Large cache sizes** (>1000 entries)  
+✅ **Mixed read/write** patterns (typical in databases, web applications)  
+✅ **High cache hit rates** (>70%)  
+✅ **Protection needed** against scan/bulk operation pollution
+
+**Ideal Use Cases:**
+- Database buffer pools
+- Web application caches (user sessions, popular content)
+- CDN edge caches
+- Application-level query result caches
+- Key-value stores with hot key patterns
+
+### 🎯 Use **Normal LRU** when:
+
+✅ **Very small cache** (<100 entries)  
+✅ **High eviction rate** (cache thrashing scenarios)  
+✅ **Uniform access patterns** (no clear hot/cold data)  
+✅ **Simplicity matters** more than performance  
+✅ **Memory overhead** must be minimized (no midpoint tracking)
+
+**Ideal Use Cases:**
+- Simple browser caches
+- Small in-memory lookups
+- Educational implementations
+- Embedded systems with limited memory
+
+---
+
+## Usage Examples
+
+### Normal LRU Cache
 
 ```go
 package main
@@ -153,46 +281,233 @@ import (
 )
 
 func main() {
-    cache := lru.NewLRUCache(2)
+    cache := lru.NewLRUCache(3)
     
-    cache.Put(1, 1)  // cache: {1=1}
-    cache.Put(2, 2)  // cache: {1=1, 2=2}
+    cache.Put(1, 100)  // cache: {1=100}
+    cache.Put(2, 200)  // cache: {1=100, 2=200}
+    cache.Put(3, 300)  // cache: {1=100, 2=200, 3=300}
     
-    fmt.Println(cache.Get(1))  // returns 1, cache: {2=2, 1=1}
+    fmt.Println(cache.Get(1))  // 100, moves 1 to front
     
-    cache.Put(3, 3)  // evicts key 2, cache: {1=1, 3=3}
+    cache.Put(4, 400)  // evicts 2, cache: {1=100, 3=300, 4=400}
     
-    fmt.Println(cache.Get(2))  // returns -1 (not found)
-    
-    cache.Put(4, 4)  // evicts key 1, cache: {3=3, 4=4}
-    
-    fmt.Println(cache.Get(1))  // returns -1 (not found)
-    fmt.Println(cache.Get(3))  // returns 3
-    fmt.Println(cache.Get(4))  // returns 4
+    fmt.Println(cache.Get(2))  // -1 (not found)
+    fmt.Println(cache.Get(3))  // 300
 }
 ```
 
-## Output
+### BufferPool LRU Cache
+
+```go
+package main
+
+import (
+    "fmt"
+    bufferpool "github.com/nishanthgowda/btree/lru/bufferpool-lru"
+)
+
+func main() {
+    // 70% old list, 30% new list
+    cache := bufferpool.NewBufferPool(10, 0.7)
+    
+    // Insert items - they go to midpoint (head of Old list)
+    for i := 1; i <= 10; i++ {
+        cache.Put(i, i*100)
+    }
+    
+    // Accessing an item promotes it to New list
+    val := cache.Get(5)  // Moves 5 to "New" list
+    fmt.Println(val)     // 500
+    
+    // Insert new item - evicts from tail of Old list
+    cache.Put(11, 1100)  // Evicts oldest item in Old list
+    
+    // Item 5 is protected in New list and won't be evicted next
+    fmt.Println(cache.Get(5))  // 500 (still present)
+}
 ```
-1
--1
--1
-3
-4
+
+### Simulating Database Workload
+
+```go
+func simulateDatabaseWorkload() {
+    cache := bufferpool.NewBufferPool(1000, 0.7)
+    
+    // Load hot data (frequently accessed customer records)
+    hotKeys := []int{1, 2, 3, 4, 5}
+    for _, key := range hotKeys {
+        cache.Put(key, key*100)
+        cache.Get(key)  // Promotes to New list
+    }
+    
+    // Simulate a table scan (lots of one-time accesses)
+    for i := 1000; i < 2000; i++ {
+        cache.Put(i, i)  // These go to Old list
+    }
+    
+    // Hot data should still be accessible
+    for _, key := range hotKeys {
+        val := cache.Get(key)
+        if val != -1 {
+            fmt.Printf("Hot key %d still in cache: %d\n", key, val)
+        }
+    }
+}
 ```
 
-## Verdict
-✅ **Yes, this is now an optimized implementation!**
+---
 
-The core algorithm was already optimal (O(1) operations), but the improvements made:
-1. Fix memory leaks through proper pointer cleanup
-2. Prevent dangling references
-3. Improve garbage collection efficiency
-4. Maintain clean memory state
+## Project Structure
 
-For production use, consider adding:
-- Thread safety (sync.RWMutex)
-- Generic types for key/value (Go 1.18+)
-- TTL (Time To Live) support
-- Eviction callbacks
-- Metrics/monitoring
+```
+lru/
+├── README.md                     # This file
+├── lru/                          # Normal LRU implementation
+│   └── lru.go
+├── bufferpool-lru/               # BufferPool LRU implementation
+│   └── lru.go
+├── doubly-ll/                    # Shared doubly linked list
+│   └── doubly_linked_list.go
+├── benchmarks/                   # Comprehensive benchmark suite
+│   └── lru_benchmark_test.go
+└── main.go                       # Demo/test program
+```
+
+---
+
+## Running Benchmarks
+
+### Quick Run
+```bash
+cd /path/to/B-Trees/lru
+go test -bench=. -benchmem ./benchmarks/
+```
+
+### Detailed Run (3 seconds per benchmark)
+```bash
+go test -bench=. -benchmem -benchtime=3s ./benchmarks/
+```
+
+### Run Specific Benchmarks
+```bash
+# Only Normal LRU
+go test -bench=BenchmarkNormalLRU -benchmem ./benchmarks/
+
+# Only BufferPool LRU
+go test -bench=BenchmarkBufferPoolLRU -benchmem ./benchmarks/
+
+# Only high locality tests
+go test -bench=HighLocality -benchmem ./benchmarks/
+```
+
+### Compare with benchstat
+```bash
+# Install benchstat
+go install golang.org/x/perf/cmd/benchstat@latest
+
+# Run and save results
+go test -bench=BenchmarkNormalLRU -benchmem ./benchmarks/ > normal.txt
+go test -bench=BenchmarkBufferPoolLRU -benchmem ./benchmarks/ > bufferpool.txt
+
+# Compare
+benchstat normal.txt bufferpool.txt
+```
+
+---
+
+## Technical Details
+
+### Time Complexity
+Both implementations maintain **O(1)** time complexity:
+- **Get(key)**: O(1) - HashMap lookup + list manipulation
+- **Put(key, value)**: O(1) - HashMap insert + list manipulation
+
+### Space Complexity
+- **Normal LRU**: O(capacity)
+- **BufferPool LRU**: O(capacity) + O(1) for midpoint tracking
+  - Additional space: 1 pointer (MidPoint), 2 integers (MaxOldSize, currentOldSize), 1 float (OldRatio)
+  - Per-node overhead: 1 boolean (IsOld)
+
+### Concurrency
+⚠️ **Neither implementation is thread-safe**. For concurrent use, wrap with `sync.RWMutex`:
+
+```go
+type ThreadSafeLRU struct {
+    mu    sync.RWMutex
+    cache *lru.LRUCache
+}
+
+func (t *ThreadSafeLRU) Get(key int) int {
+    t.mu.RLock()
+    defer t.mu.RUnlock()
+    return t.cache.Get(key)
+}
+
+func (t *ThreadSafeLRU) Put(key, value int) {
+    t.mu.Lock()
+    defer t.mu.Unlock()
+    t.cache.Put(key, value)
+}
+```
+
+---
+
+## Future Enhancements
+
+### Possible Improvements
+1. **Generic Types** (Go 1.18+)
+   ```go
+   type LRUCache[K comparable, V any] struct { ... }
+   ```
+
+2. **TTL Support** (time-based eviction)
+   ```go
+   type Node struct {
+       ...
+       ExpiresAt time.Time
+   }
+   ```
+
+3. **Eviction Callbacks**
+   ```go
+   cache.OnEvict(func(key, value int) {
+       log.Printf("Evicted: %d=%d", key, value)
+   })
+   ```
+
+4. **Adaptive Ratio Tuning**
+   - Dynamically adjust OldRatio based on access patterns
+   - Monitor hit rates and eviction patterns
+
+5. **Metrics and Monitoring**
+   - Hit/miss ratios
+   - Eviction counts
+   - Promotion rates (Old → New)
+
+---
+
+## References
+
+### MySQL InnoDB Buffer Pool
+- [MySQL 8.0 Reference Manual - The InnoDB Buffer Pool](https://dev.mysql.com/doc/refman/8.0/en/innodb-buffer-pool.html)
+- [Making the Buffer Pool Scan Resistant](https://dev.mysql.com/doc/refman/8.0/en/innodb-performance-midpoint_insertion.html)
+
+### LRU Cache Algorithms
+- [LeetCode Problem 146: LRU Cache](https://leetcode.com/problems/lru-cache/)
+- [Cache Replacement Policies](https://en.wikipedia.org/wiki/Cache_replacement_policies)
+
+---
+
+## License
+
+MIT License - feel free to use this in your projects!
+
+---
+
+## Contributing
+
+Found a bug or have an optimization idea? Feel free to open an issue or submit a pull request!
+
+---
+
+**Built with ❤️ exploring database internals and cache algorithms**
